@@ -28,6 +28,8 @@ INSTANCE_MUTEX_HANDLE = None
 DEFAULT_SETTINGS = {
     "width": 282,
     "height": 260,
+    "window_x": 80,
+    "window_y": 80,
     "background": "#202328",
     "border": "#30343a",
     "text": "#a1a8b1",
@@ -383,6 +385,8 @@ def normalize_settings(settings: dict) -> dict:
     normalized.pop("opacity", None)
     normalized["width"] = clamp_int(normalized.get("width"), DEFAULT_SETTINGS["width"], 220, 800)
     normalized["height"] = clamp_int(normalized.get("height"), DEFAULT_SETTINGS["height"], 90, 1000)
+    normalized["window_x"] = clamp_int(normalized.get("window_x"), DEFAULT_SETTINGS["window_x"], -10000, 10000)
+    normalized["window_y"] = clamp_int(normalized.get("window_y"), DEFAULT_SETTINGS["window_y"], -10000, 10000)
     normalized["background_opacity"] = clamp_float(
         normalized.get("background_opacity"),
         DEFAULT_SETTINGS["background_opacity"],
@@ -442,8 +446,12 @@ class TickerApp:
     def __init__(self) -> None:
         self.settings = load_settings()
         self.root = tk.Tk()
+        self.root.withdraw()
         self.root.title("桌面实时行情")
-        self.root.geometry(f"{self.settings['width']}x{self.settings['height']}+80+80")
+        self.root.geometry(
+            f"{self.settings['width']}x{self.settings['height']}"
+            f"{self.settings['window_x']:+d}{self.settings['window_y']:+d}"
+        )
         self.root.minsize(220, 90)
         self.root.configure(bg=TRANSPARENT_COLOR)
         self.root.attributes("-topmost", self.settings["always_on_top"])
@@ -454,6 +462,7 @@ class TickerApp:
             pass
         self.root.overrideredirect(True)
         self.bg_root = tk.Toplevel(self.root)
+        self.bg_root.withdraw()
         self.bg_root.overrideredirect(True)
         self.bg_root.configure(bg=self.settings["background"] or TRANSPARENT_COLOR)
         self.bg_root.attributes("-topmost", self.settings["always_on_top"])
@@ -476,6 +485,8 @@ class TickerApp:
         self.refresh_job: str | None = None
         self.settings_window: tk.Toplevel | None = None
         self.locked = False
+        self.position_restored = False
+        self.starting = True
 
         self.font_title = font.Font(family="Microsoft YaHei UI", size=self.settings["font_size"])
         self.font_small = font.Font(family="Microsoft YaHei UI", size=max(6, self.settings["font_size"] - 1))
@@ -483,6 +494,10 @@ class TickerApp:
 
         self.build_ui()
         self.apply_settings()
+        self.starting = False
+        self.root.deiconify()
+        self.root.update_idletasks()
+        self.sync_background_window()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.bg_root.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
@@ -512,7 +527,7 @@ class TickerApp:
         self.muted_widgets.append(self.status_label)
         self.status_label.pack(anchor="w", padx=7, pady=(7, 0))
 
-        self.refresh_button = self.action_button(top, "↻", self.request_refresh)
+        self.refresh_button = self.action_button(top, "↻", self.refresh)
         self.pin_button = self.action_button(top, "⌖", self.toggle_top, active=True)
         self.settings_button = self.action_button(top, "⚙", self.open_settings)
         self.lock_button = self.action_button(top, "🔒", self.toggle_lock)
@@ -615,7 +630,14 @@ class TickerApp:
         self.settings = normalize_settings(self.settings)
         width = self.settings["width"]
         height = self.settings["height"]
-        self.root.geometry(f"{width}x{height}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+        if self.position_restored:
+            window_x = self.root.winfo_x()
+            window_y = self.root.winfo_y()
+        else:
+            window_x = self.settings["window_x"]
+            window_y = self.settings["window_y"]
+            self.position_restored = True
+        self.root.geometry(f"{width}x{height}{window_x:+d}{window_y:+d}")
         background = self.display_background()
         self.root.configure(bg=background)
         self.root.attributes("-alpha", 1.0)
@@ -670,17 +692,17 @@ class TickerApp:
         return TRANSPARENT_COLOR
 
     def sync_background_window(self) -> None:
-        if self.is_background_transparent():
+        if self.starting or self.is_background_transparent():
             self.bg_root.withdraw()
             return
         self.root.update_idletasks()
-        self.bg_root.deiconify()
         self.bg_root.configure(bg=self.settings["background"])
         self.bg_root.geometry(
             f"{self.root.winfo_width()}x{self.root.winfo_height()}+{self.root.winfo_x()}+{self.root.winfo_y()}"
         )
         self.bg_root.attributes("-alpha", self.settings["background_opacity"])
         self.bg_root.attributes("-topmost", self.settings["always_on_top"])
+        self.bg_root.deiconify()
         self.keep_background_behind()
 
     def keep_background_behind(self) -> None:
@@ -698,8 +720,6 @@ class TickerApp:
         return self.display_background() if is_no_color(value) else value
 
     def open_settings(self) -> None:
-        if self.locked:
-            return
         if self.settings_window and self.settings_window.winfo_exists():
             self.settings_window.lift()
             self.settings_window.focus_force()
@@ -1191,8 +1211,6 @@ class TickerApp:
         row["change"].config(text=" / ".join(parts) if parts else "--", fg=color)
 
     def toggle_top(self) -> None:
-        if self.locked:
-            return
         current = bool(self.root.attributes("-topmost"))
         next_value = not current
         self.root.attributes("-topmost", next_value)
@@ -1204,16 +1222,21 @@ class TickerApp:
 
     def toggle_lock(self) -> None:
         self.locked = not self.locked
-        if self.locked and self.settings_window and self.settings_window.winfo_exists():
-            self.settings_window.destroy()
-            self.settings_window = None
-        disabled_state = "disabled" if self.locked else "normal"
-        for button in (self.refresh_button, self.pin_button, self.settings_button, self.close_button):
-            button.config(state=disabled_state)
         self.lock_button.config(
             text="🔓" if self.locked else "🔒",
             fg=self.text_color("accent") if self.locked else self.text_color("button"),
         )
+
+    def invoke_action_button_at(self, x_root: int, y_root: int) -> bool:
+        for button in self.button_widgets:
+            if str(button.cget("state")) != "normal":
+                continue
+            left = button.winfo_rootx()
+            top = button.winfo_rooty()
+            if left <= x_root < left + button.winfo_width() and top <= y_root < top + button.winfo_height():
+                button.invoke()
+                return True
+        return False
 
     def start_drag(self, event) -> None:
         if self.locked:
@@ -1244,6 +1267,8 @@ class TickerApp:
 
     def start_background_pointer(self, event) -> None:
         self.keep_background_behind()
+        if self.invoke_action_button_at(event.x_root, event.y_root):
+            return
         if self.locked:
             return
         if event.x >= self.bg_root.winfo_width() - 18 and event.y >= self.bg_root.winfo_height() - 18:
@@ -1285,6 +1310,13 @@ class TickerApp:
         self.sync_background_window()
 
     def close(self) -> None:
+        try:
+            if self.root.winfo_exists():
+                self.settings["window_x"] = self.root.winfo_x()
+                self.settings["window_y"] = self.root.winfo_y()
+                save_settings(self.settings)
+        except tk.TclError:
+            pass
         if self.refresh_job is not None:
             try:
                 self.root.after_cancel(self.refresh_job)
