@@ -6,7 +6,7 @@ import re
 import threading
 import time
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from tkinter import colorchooser, font, ttk
@@ -41,6 +41,7 @@ DEFAULT_SETTINGS = {
     "down": "#29d391",
     "flat": "#aab1ba",
     "background_opacity": 0.62,
+    "trend_opacity": 0.38,
     "font_size": 8,
     "price_font_size": 10,
     "price_decimals": 2,
@@ -52,17 +53,18 @@ DEFAULT_SETTINGS = {
 }
 
 BASE_QUOTE_DEFS = {
-    "xau": {"name": "纽约金", "symbol": "GC=F"},
+    "xau": {"name": "纽约金", "symbol": "hf_GC"},
     "cn": {"name": "国内金价", "symbol": "SGE_AUTD"},
-    "nq": {"name": "纳指期货", "symbol": "NQ=F"},
+    "nq": {"name": "纳指期货", "symbol": "hf_NQ"},
     "sh": {"name": "上证指数", "symbol": "sh000001"},
     "star": {"name": "科创50", "symbol": "sh000688"},
-    "oil": {"name": "纽约原油", "symbol": "CL=F"},
-    "usd": {"name": "美元汇率", "symbol": "CNY=X"},
-    "jpy": {"name": "日元汇率", "symbol": "JPYCNY=X"},
+    "oil": {"name": "纽约原油", "symbol": "hf_CL"},
+    "usd": {"name": "美元汇率", "symbol": "fx_susdcny"},
+    "jpy": {"name": "日元汇率", "symbol": "fx_sjpycny"},
 }
 QUOTE_DEFS = dict(BASE_QUOTE_DEFS)
 STOCK_KEY_PREFIX = "a_stock:"
+GLOBAL_TREND_SYMBOLS = {"xau": "GC", "nq": "NQ", "oil": "CL"}
 
 
 def acquire_single_instance() -> bool:
@@ -100,6 +102,7 @@ class Quote:
     source: str = ""
     error: str | None = None
     decimals: int = 2
+    trend: list[float] = field(default_factory=list)
 
     @property
     def direction(self) -> str:
@@ -240,16 +243,91 @@ def parse_sina_a_stock(values: list[str], symbol: str) -> Quote:
     return Quote(name or "自选A股", symbol, price, change, percent, "元", "新浪")
 
 
-def fetch_sina_quotes(a_stock_codes=None) -> dict[str, Quote]:
+def parse_sina_global_future(values: list[str], name: str, symbol: str, unit: str) -> Quote:
+    price = as_float(values[0] if values else None)
+    previous_close = as_float(values[7] if len(values) > 7 else None)
+    if price is None:
+        raise RuntimeError(f"{name}价格为空")
+    change = price - previous_close if previous_close is not None else None
+    percent = (change / previous_close * 100) if change is not None and previous_close else None
+    return Quote(name, symbol, price, change, percent, unit, "新浪")
+
+
+def parse_sina_fx(values: list[str], name: str, symbol: str) -> Quote:
+    price = as_float(values[8] if len(values) > 8 else None)
+    previous_close = as_float(values[3] if len(values) > 3 else None)
+    percent = as_float(values[10] if len(values) > 10 else None)
+    if price is None:
+        raise RuntimeError(f"{name}价格为空")
+    change = price - previous_close if previous_close is not None else None
+    return Quote(name, symbol, price, change, percent, "CNY", "新浪", decimals=4)
+
+
+def fetch_sina_intraday_trend(symbol: str) -> list[float]:
+    url = (
+        "https://quotes.sina.cn/cn/api/openapi.php/"
+        f"CN_MarketDataService.getKLineData?symbol={quote(symbol)}&scale=5&ma=no&datalen=48"
+    )
+    data = json.loads(http_get(url, "utf-8", {"Accept": "application/json"}))
+    values = data.get("result", {}).get("data") or []
+    return [
+        value
+        for item in values
+        if isinstance(item, dict) and (value := as_float(item.get("close"))) is not None
+    ]
+
+
+def fetch_sina_global_intraday_trend(symbol: str) -> list[float]:
+    url = (
+        "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_data=/"
+        f"GlobalFuturesService.getGlobalFuturesMinLine?symbol={quote(symbol)}"
+    )
+    text = http_get(url, "utf-8", {"Accept": "application/json"})
+    match = re.search(r"var\s+_data=\((.*)\)\s*;?\s*$", text, re.S)
+    if not match:
+        return []
+    data = json.loads(match.group(1))
+    values = data.get("minLine_1d") or []
+    return [
+        value
+        for item in values
+        if isinstance(item, list) and len(item) > 1 and (value := as_float(item[1])) is not None
+    ]
+
+
+def fetch_sina_trends(keys: list[str]) -> dict[str, list[float]]:
+    trends: dict[str, list[float]] = {}
+    for key in keys:
+        definition = QUOTE_DEFS.get(key)
+        if definition is None:
+            continue
+        try:
+            if key in GLOBAL_TREND_SYMBOLS:
+                values = fetch_sina_global_intraday_trend(GLOBAL_TREND_SYMBOLS[key])
+            else:
+                values = fetch_sina_intraday_trend(definition["symbol"])
+        except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError):
+            continue
+        if values:
+            trends[key] = values
+    return trends
+
+
+def fetch_sina_quotes(a_stock_codes=None, trends: dict[str, list[float]] | None = None) -> dict[str, Quote]:
     a_stock_symbols = normalize_a_stock_codes(a_stock_codes)
     sync_quote_defs(a_stock_symbols)
-    symbols = ["SGE_AUTD", "sh000001", "sh000688"]
+    symbols = ["hf_GC", "SGE_AUTD", "hf_NQ", "sh000001", "sh000688", "hf_CL", "fx_susdcny", "fx_sjpycny"]
     symbols.extend(a_stock_symbols)
     assignments = parse_sina_assignments(http_get(f"https://hq.sinajs.cn/list={','.join(symbols)}", "gbk"))
     parsers = {
+        "xau": lambda: parse_sina_global_future(assignments.get("hf_GC", []), "纽约金", "hf_GC", "USD/oz"),
         "cn": lambda: parse_china_gold(assignments.get("SGE_AUTD", [])),
+        "nq": lambda: parse_sina_global_future(assignments.get("hf_NQ", []), "纳指期货", "hf_NQ", "USD"),
         "sh": lambda: parse_sina_index(assignments.get("sh000001", []), "sh", "上证指数", "sh000001"),
         "star": lambda: parse_sina_index(assignments.get("sh000688", []), "star", "科创50", "sh000688"),
+        "oil": lambda: parse_sina_global_future(assignments.get("hf_CL", []), "纽约原油", "hf_CL", "USD/bbl"),
+        "usd": lambda: parse_sina_fx(assignments.get("fx_susdcny", []), "美元汇率", "fx_susdcny"),
+        "jpy": lambda: parse_sina_fx(assignments.get("fx_sjpycny", []), "日元汇率", "fx_sjpycny"),
     }
     for symbol in a_stock_symbols:
         parsers[stock_quote_key(symbol)] = lambda stock_symbol=symbol: parse_sina_a_stock(
@@ -261,53 +339,10 @@ def fetch_sina_quotes(a_stock_codes=None) -> dict[str, Quote]:
         definition = QUOTE_DEFS[key]
         try:
             quotes[key] = parser()
+            quotes[key].trend = list((trends or {}).get(key, []))
         except RuntimeError as exc:
             quotes[key] = Quote(definition["name"], definition["symbol"], error=str(exc))
     return quotes
-
-
-def fetch_yahoo_quote(name: str, symbol: str, unit: str, decimals: int = 2) -> Quote:
-    chart_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(symbol)}?range=1d&interval=1m"
-    text = http_get(chart_url, "utf-8", {"Accept": "application/json"})
-    data = json.loads(text)
-    result = data.get("chart", {}).get("result", [])
-    meta = result[0].get("meta", {}) if result else {}
-    price = meta.get("regularMarketPrice")
-    previous = meta.get("chartPreviousClose") or meta.get("previousClose")
-    if not isinstance(price, (int, float)):
-        raise RuntimeError(f"{name}价格为空")
-    change = float(price - previous) if isinstance(previous, (int, float)) else None
-    percent = (change / previous * 100) if change is not None and previous else None
-    return Quote(name, symbol, float(price), change, percent, unit, "Yahoo", decimals=decimals)
-
-
-def fetch_new_york_gold() -> Quote:
-    return fetch_yahoo_quote("纽约金", "GC=F", "USD/oz")
-
-
-def fetch_nasdaq_future() -> Quote:
-    return fetch_yahoo_quote("纳指期货", "NQ=F", "USD")
-
-
-def fetch_new_york_oil() -> Quote:
-    return fetch_yahoo_quote("纽约原油", "CL=F", "USD/bbl")
-
-
-def fetch_usd_cny() -> Quote:
-    return fetch_yahoo_quote("美元汇率", "CNY=X", "CNY/USD", 4)
-
-
-def fetch_jpy_cny() -> Quote:
-    return fetch_yahoo_quote("日元汇率", "JPYCNY=X", "CNY/JPY", 4)
-
-
-def safe_fetch(fetcher, name: str, symbol: str) -> Quote:
-    try:
-        return fetcher()
-    except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
-        return Quote(name, symbol, error=str(exc))
-    except Exception as exc:
-        return Quote(name, symbol, error=f"未知错误：{exc}")
 
 
 def clamp_int(value, default: int, minimum: int, maximum: int) -> int:
@@ -393,6 +428,12 @@ def normalize_settings(settings: dict) -> dict:
         0.0,
         1.0,
     )
+    normalized["trend_opacity"] = clamp_float(
+        normalized.get("trend_opacity"),
+        DEFAULT_SETTINGS["trend_opacity"],
+        0.0,
+        1.0,
+    )
     normalized.pop("text_opacity", None)
     normalized["font_size"] = clamp_int(normalized.get("font_size"), DEFAULT_SETTINGS["font_size"], 6, 20)
     normalized["price_font_size"] = clamp_int(
@@ -475,12 +516,16 @@ class TickerApp:
         self.drag_start = (0, 0)
         self.drag_mode = "move"
         self.resize_start = (0, 0, 0, 0)
-        self.rows: dict[str, dict[str, tk.Label]] = {}
+        self.rows: dict[str, dict[str, tk.Widget]] = {}
         self.bg_widgets: list[tk.Widget] = []
         self.text_widgets: list[tk.Widget] = []
         self.muted_widgets: list[tk.Widget] = []
         self.button_widgets: list[tk.Button] = []
         self.latest_quotes: list[tuple[str, Quote]] = []
+        self.sina_trends: dict[str, list[float]] = {}
+        self.sina_trend_times: dict[str, float] = {}
+        self.local_trends: dict[str, list[float]] = {}
+        self.local_trend_day = datetime.now().date()
         self.refreshing = False
         self.refresh_job: str | None = None
         self.settings_window: tk.Toplevel | None = None
@@ -607,7 +652,21 @@ class TickerApp:
         change_label = tk.Label(right, text="--", bg=self.settings["background"], fg=self.settings["muted"], font=self.font_small, width=9, anchor="e")
         self.muted_widgets.append(change_label)
         change_label.pack(side="left", padx=(4, 0))
-        return {"row": row, "name": name_label, "price": price_label, "change": change_label}
+
+        trend_canvas = tk.Canvas(
+            row,
+            bg=self.settings["background"],
+            width=50,
+            height=15,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.bg_widgets.append(trend_canvas)
+        trend_canvas.pack(side="right", padx=(2, 2), pady=1)
+        trend_canvas.bind("<ButtonPress-1>", self.start_drag)
+        trend_canvas.bind("<B1-Motion>", self.drag)
+        trend_canvas.bind("<Double-Button-1>", lambda _event: self.request_refresh())
+        return {"row": row, "name": name_label, "trend": trend_canvas, "price": price_label, "change": change_label}
 
     def ordered_visible_quote_keys(self) -> list[str]:
         visible = set(self.settings["quote_visible"])
@@ -736,6 +795,7 @@ class TickerApp:
 
         values = {
             "background_opacity": tk.IntVar(value=int(self.settings["background_opacity"] * 100)),
+            "trend_opacity": tk.IntVar(value=int(self.settings["trend_opacity"] * 100)),
             "font_size": tk.StringVar(value=str(self.settings["font_size"])),
             "price_font_size": tk.StringVar(value=str(self.settings["price_font_size"])),
             "price_decimals": tk.StringVar(value=str(self.settings["price_decimals"])),
@@ -847,6 +907,7 @@ class TickerApp:
             next_settings = {
                 **self.settings,
                 "background_opacity": clamp_float(values["background_opacity"].get(), 62, 0, 100) / 100,
+                "trend_opacity": clamp_float(values["trend_opacity"].get(), 38, 0, 100) / 100,
                 "font_size": values["font_size"].get(),
                 "price_font_size": values["price_font_size"].get(),
                 "price_decimals": values["price_decimals"].get(),
@@ -1072,6 +1133,7 @@ class TickerApp:
 
         opacity_box = section(display_tab, "透明度", "0 表示完全透明，100 表示完全显示。")
         add_scale(opacity_box, "背景透明度", "background_opacity", "%")
+        add_scale(opacity_box, "趋势线透明度", "trend_opacity", "%")
         tk.Label(display_tab, text="窗口大小：拖动主窗口右下角的小角标调整，松开后自动保存。", bg="#ffffff", fg="#64748b", wraplength=380, justify="left").pack(anchor="w", padx=24, pady=(12, 0))
 
         font_box = section(display_tab, "字号")
@@ -1128,46 +1190,69 @@ class TickerApp:
 
     def fetch_in_background(self) -> None:
         start = time.perf_counter()
+        visible_keys = set(self.ordered_visible_quote_keys())
+        trend_keys = [
+            key
+            for key in visible_keys
+            if key in GLOBAL_TREND_SYMBOLS or key in {"sh", "star"} or key.startswith(STOCK_KEY_PREFIX)
+        ]
+        now = time.time()
+        stale_keys = [
+            key for key in trend_keys if now - self.sina_trend_times.get(key, 0) >= 300
+        ]
+        if stale_keys:
+            self.sina_trends.update(fetch_sina_trends(stale_keys))
+            for key in stale_keys:
+                self.sina_trend_times[key] = now
         try:
-            sina_quotes = fetch_sina_quotes(self.settings["a_stock_codes"])
+            sina_quotes = fetch_sina_quotes(self.settings["a_stock_codes"], self.sina_trends)
         except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
             sina_quotes = {
-                "cn": Quote("国内金价", "SGE_AUTD", error=str(exc)),
-                "sh": Quote("上证指数", "sh000001", error=str(exc)),
-                "star": Quote("科创50", "sh000688", error=str(exc)),
+                key: Quote(definition["name"], definition["symbol"], error=str(exc))
+                for key, definition in QUOTE_DEFS.items()
             }
-            for symbol in self.settings["a_stock_codes"]:
-                sina_quotes[stock_quote_key(symbol)] = Quote("自选A股", symbol, error=str(exc))
         except Exception as exc:
             sina_quotes = {
-                "cn": Quote("国内金价", "SGE_AUTD", error=f"未知错误：{exc}"),
-                "sh": Quote("上证指数", "sh000001", error=f"未知错误：{exc}"),
-                "star": Quote("科创50", "sh000688", error=f"未知错误：{exc}"),
+                key: Quote(definition["name"], definition["symbol"], error=f"未知错误：{exc}")
+                for key, definition in QUOTE_DEFS.items()
             }
-            for symbol in self.settings["a_stock_codes"]:
-                sina_quotes[stock_quote_key(symbol)] = Quote("自选A股", symbol, error=f"未知错误：{exc}")
-        stock_quotes = [
-            (
-                stock_quote_key(symbol),
-                sina_quotes.get(stock_quote_key(symbol)) or Quote("自选A股", symbol, error="未设置股票代码"),
-            )
-            for symbol in self.settings["a_stock_codes"]
-        ]
         quotes = [
-            *stock_quotes,
-            ("xau", safe_fetch(fetch_new_york_gold, "纽约金", "GC=F")),
+            *[
+                (
+                    stock_quote_key(symbol),
+                    sina_quotes.get(stock_quote_key(symbol)) or Quote("自选A股", symbol, error="未设置股票代码"),
+                )
+                for symbol in self.settings["a_stock_codes"]
+            ],
+            ("xau", sina_quotes["xau"]),
             ("cn", sina_quotes["cn"]),
-            ("nq", safe_fetch(fetch_nasdaq_future, "纳指期货", "NQ=F")),
+            ("nq", sina_quotes["nq"]),
             ("sh", sina_quotes["sh"]),
             ("star", sina_quotes["star"]),
-            ("oil", safe_fetch(fetch_new_york_oil, "纽约原油", "CL=F")),
-            ("usd", safe_fetch(fetch_usd_cny, "美元汇率", "CNY=X")),
-            ("jpy", safe_fetch(fetch_jpy_cny, "日元汇率", "JPYCNY=X")),
+            ("oil", sina_quotes["oil"]),
+            ("usd", sina_quotes["usd"]),
+            ("jpy", sina_quotes["jpy"]),
         ]
         elapsed = int((time.perf_counter() - start) * 1000)
         self.root.after(0, lambda: self.apply_quotes(quotes, elapsed))
 
     def apply_quotes(self, quotes, elapsed: int) -> None:
+        today = datetime.now().date()
+        if today != self.local_trend_day:
+            self.local_trends.clear()
+            self.local_trend_day = today
+        for key, quote in quotes:
+            if quote.price is None:
+                continue
+            local_values = self.local_trends.setdefault(key, [])
+            local_values.append(quote.price)
+            if len(local_values) > 2000:
+                del local_values[:-2000]
+            if quote.trend:
+                if quote.trend[-1] != quote.price:
+                    quote.trend = [*quote.trend, quote.price]
+            else:
+                quote.trend = list(local_values)
         self.latest_quotes = quotes
         ok_count = 0
         visible = set(self.ordered_visible_quote_keys())
@@ -1190,6 +1275,7 @@ class TickerApp:
         row["name"].config(text=quote.name)
         row["price"].config(bg=background)
         row["change"].config(bg=background)
+        self.draw_trend(row["trend"], quote.trend)
         if quote.error:
             row["price"].config(text="--", fg=self.text_color("muted"))
             row["change"].config(text="失败", fg=self.text_color("muted"))
@@ -1209,6 +1295,44 @@ class TickerApp:
         elif quote.change is not None:
             parts.append(f"{quote.change:+,.2f}")
         row["change"].config(text=" / ".join(parts) if parts else "--", fg=color)
+
+    def draw_trend(self, canvas: tk.Canvas, values: list[float]) -> None:
+        canvas.delete("all")
+        values = [value for value in values if math.isfinite(value)]
+        if not values:
+            return
+        width = int(canvas.cget("width"))
+        height = int(canvas.cget("height"))
+        if len(values) > width:
+            values = [
+                values[round(index * (len(values) - 1) / (width - 1))]
+                for index in range(width)
+            ]
+        color_key = "flat"
+        if values[-1] > values[0]:
+            color_key = "up"
+        elif values[-1] < values[0]:
+            color_key = "down"
+        color = self.trend_color(color_key)
+        if len(values) == 1:
+            canvas.create_line(2, height // 2, width - 2, height // 2, fill=color, width=1)
+            return
+        low = min(values)
+        high = max(values)
+        span = high - low
+        points = []
+        for index, value in enumerate(values):
+            x = 1 + index * (width - 2) / (len(values) - 1)
+            y = height / 2 if span == 0 else 1 + (high - value) * (height - 2) / span
+            points.extend((x, y))
+        canvas.create_line(*points, fill=color, width=1, smooth=True)
+
+    def trend_color(self, color_key: str) -> str:
+        color = self.text_color(color_key)
+        background = self.settings["background"]
+        if is_no_color(background):
+            return color
+        return blend_hex(color, background, self.settings["trend_opacity"])
 
     def toggle_top(self) -> None:
         current = bool(self.root.attributes("-topmost"))
