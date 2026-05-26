@@ -7,7 +7,7 @@ import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import colorchooser, font, ttk
 from urllib.error import URLError, HTTPError
@@ -42,6 +42,7 @@ DEFAULT_SETTINGS = {
     "flat": "#aab1ba",
     "background_opacity": 0.62,
     "trend_opacity": 0.38,
+    "text_opacity": 0.68,
     "font_size": 8,
     "price_font_size": 10,
     "price_decimals": 2,
@@ -103,6 +104,7 @@ class Quote:
     error: str | None = None
     decimals: int = 2
     trend: list[float] = field(default_factory=list)
+    trend_progress: float = 1.0
 
     @property
     def direction(self) -> str:
@@ -263,21 +265,22 @@ def parse_sina_fx(values: list[str], name: str, symbol: str) -> Quote:
     return Quote(name, symbol, price, change, percent, "CNY", "新浪", decimals=4)
 
 
-def fetch_sina_intraday_trend(symbol: str) -> list[float]:
+def fetch_sina_intraday_trend(symbol: str) -> tuple[list[float], float]:
     url = (
         "https://quotes.sina.cn/cn/api/openapi.php/"
         f"CN_MarketDataService.getKLineData?symbol={quote(symbol)}&scale=5&ma=no&datalen=48"
     )
     data = json.loads(http_get(url, "utf-8", {"Accept": "application/json"}))
     values = data.get("result", {}).get("data") or []
-    return [
+    trend = [
         value
         for item in values
         if isinstance(item, dict) and (value := as_float(item.get("close"))) is not None
     ]
+    return trend, min(1.0, len(trend) / 48)
 
 
-def fetch_sina_global_intraday_trend(symbol: str) -> list[float]:
+def fetch_sina_global_intraday_trend(symbol: str) -> tuple[list[float], float]:
     url = (
         "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_data=/"
         f"GlobalFuturesService.getGlobalFuturesMinLine?symbol={quote(symbol)}"
@@ -285,35 +288,49 @@ def fetch_sina_global_intraday_trend(symbol: str) -> list[float]:
     text = http_get(url, "utf-8", {"Accept": "application/json"})
     match = re.search(r"var\s+_data=\((.*)\)\s*;?\s*$", text, re.S)
     if not match:
-        return []
+        return [], 0.0
     data = json.loads(match.group(1))
     values = data.get("minLine_1d") or []
-    return [
+    trend = [
         value
         for item in values
         if isinstance(item, list) and len(item) > 1 and (value := as_float(item[1])) is not None
     ]
+    if not values:
+        return trend, 0.0
+    try:
+        latest = datetime.strptime(values[-1][-1], "%Y-%m-%d %H:%M:%S")
+    except (IndexError, TypeError, ValueError):
+        return trend, 1.0
+    session_start = latest.replace(hour=6, minute=0, second=0, microsecond=0)
+    if latest < session_start:
+        session_start -= timedelta(days=1)
+    progress = (latest - session_start).total_seconds() / (23 * 60 * 60)
+    return trend, max(0.0, min(1.0, progress))
 
 
-def fetch_sina_trends(keys: list[str]) -> dict[str, list[float]]:
-    trends: dict[str, list[float]] = {}
+def fetch_sina_trends(keys: list[str]) -> dict[str, tuple[list[float], float]]:
+    trends: dict[str, tuple[list[float], float]] = {}
     for key in keys:
         definition = QUOTE_DEFS.get(key)
         if definition is None:
             continue
         try:
             if key in GLOBAL_TREND_SYMBOLS:
-                values = fetch_sina_global_intraday_trend(GLOBAL_TREND_SYMBOLS[key])
+                values, progress = fetch_sina_global_intraday_trend(GLOBAL_TREND_SYMBOLS[key])
             else:
-                values = fetch_sina_intraday_trend(definition["symbol"])
+                values, progress = fetch_sina_intraday_trend(definition["symbol"])
         except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError):
             continue
         if values:
-            trends[key] = values
+            trends[key] = (values, progress)
     return trends
 
 
-def fetch_sina_quotes(a_stock_codes=None, trends: dict[str, list[float]] | None = None) -> dict[str, Quote]:
+def fetch_sina_quotes(
+    a_stock_codes=None,
+    trends: dict[str, tuple[list[float], float]] | None = None,
+) -> dict[str, Quote]:
     a_stock_symbols = normalize_a_stock_codes(a_stock_codes)
     sync_quote_defs(a_stock_symbols)
     symbols = ["hf_GC", "SGE_AUTD", "hf_NQ", "sh000001", "sh000688", "hf_CL", "fx_susdcny", "fx_sjpycny"]
@@ -339,7 +356,9 @@ def fetch_sina_quotes(a_stock_codes=None, trends: dict[str, list[float]] | None 
         definition = QUOTE_DEFS[key]
         try:
             quotes[key] = parser()
-            quotes[key].trend = list((trends or {}).get(key, []))
+            if key in (trends or {}):
+                quotes[key].trend, quotes[key].trend_progress = trends[key]
+                quotes[key].trend = list(quotes[key].trend)
         except RuntimeError as exc:
             quotes[key] = Quote(definition["name"], definition["symbol"], error=str(exc))
     return quotes
@@ -434,7 +453,12 @@ def normalize_settings(settings: dict) -> dict:
         0.0,
         1.0,
     )
-    normalized.pop("text_opacity", None)
+    normalized["text_opacity"] = clamp_float(
+        normalized.get("text_opacity"),
+        DEFAULT_SETTINGS["text_opacity"],
+        0.0,
+        1.0,
+    )
     normalized["font_size"] = clamp_int(normalized.get("font_size"), DEFAULT_SETTINGS["font_size"], 6, 20)
     normalized["price_font_size"] = clamp_int(
         normalized.get("price_font_size"),
@@ -522,7 +546,7 @@ class TickerApp:
         self.muted_widgets: list[tk.Widget] = []
         self.button_widgets: list[tk.Button] = []
         self.latest_quotes: list[tuple[str, Quote]] = []
-        self.sina_trends: dict[str, list[float]] = {}
+        self.sina_trends: dict[str, tuple[list[float], float]] = {}
         self.sina_trend_times: dict[str, float] = {}
         self.local_trends: dict[str, list[float]] = {}
         self.local_trend_day = datetime.now().date()
@@ -772,7 +796,10 @@ class TickerApp:
         value = self.settings[key]
         if is_no_color(value):
             return self.display_background()
-        return value
+        background = self.settings["background"]
+        if is_no_color(background):
+            return value
+        return blend_hex(value, background, self.settings["text_opacity"])
 
     def ui_color(self, key: str) -> str:
         value = self.settings[key]
@@ -796,6 +823,7 @@ class TickerApp:
         values = {
             "background_opacity": tk.IntVar(value=int(self.settings["background_opacity"] * 100)),
             "trend_opacity": tk.IntVar(value=int(self.settings["trend_opacity"] * 100)),
+            "text_opacity": tk.IntVar(value=int(self.settings["text_opacity"] * 100)),
             "font_size": tk.StringVar(value=str(self.settings["font_size"])),
             "price_font_size": tk.StringVar(value=str(self.settings["price_font_size"])),
             "price_decimals": tk.StringVar(value=str(self.settings["price_decimals"])),
@@ -908,6 +936,7 @@ class TickerApp:
                 **self.settings,
                 "background_opacity": clamp_float(values["background_opacity"].get(), 62, 0, 100) / 100,
                 "trend_opacity": clamp_float(values["trend_opacity"].get(), 38, 0, 100) / 100,
+                "text_opacity": clamp_float(values["text_opacity"].get(), 68, 0, 100) / 100,
                 "font_size": values["font_size"].get(),
                 "price_font_size": values["price_font_size"].get(),
                 "price_decimals": values["price_decimals"].get(),
@@ -1134,6 +1163,7 @@ class TickerApp:
         opacity_box = section(display_tab, "透明度", "0 表示完全透明，100 表示完全显示。")
         add_scale(opacity_box, "背景透明度", "background_opacity", "%")
         add_scale(opacity_box, "趋势线透明度", "trend_opacity", "%")
+        add_scale(opacity_box, "文字透明度", "text_opacity", "%")
         tk.Label(display_tab, text="窗口大小：拖动主窗口右下角的小角标调整，松开后自动保存。", bg="#ffffff", fg="#64748b", wraplength=380, justify="left").pack(anchor="w", padx=24, pady=(12, 0))
 
         font_box = section(display_tab, "字号")
@@ -1253,6 +1283,7 @@ class TickerApp:
                     quote.trend = [*quote.trend, quote.price]
             else:
                 quote.trend = list(local_values)
+                quote.trend_progress = min(1.0, max(0.08, len(local_values) / 48))
         self.latest_quotes = quotes
         ok_count = 0
         visible = set(self.ordered_visible_quote_keys())
@@ -1275,7 +1306,7 @@ class TickerApp:
         row["name"].config(text=quote.name)
         row["price"].config(bg=background)
         row["change"].config(bg=background)
-        self.draw_trend(row["trend"], quote.trend)
+        self.draw_trend(row["trend"], quote.trend, quote.trend_progress)
         if quote.error:
             row["price"].config(text="--", fg=self.text_color("muted"))
             row["change"].config(text="失败", fg=self.text_color("muted"))
@@ -1296,17 +1327,18 @@ class TickerApp:
             parts.append(f"{quote.change:+,.2f}")
         row["change"].config(text=" / ".join(parts) if parts else "--", fg=color)
 
-    def draw_trend(self, canvas: tk.Canvas, values: list[float]) -> None:
+    def draw_trend(self, canvas: tk.Canvas, values: list[float], progress: float = 1.0) -> None:
         canvas.delete("all")
         values = [value for value in values if math.isfinite(value)]
         if not values:
             return
         width = int(canvas.cget("width"))
         height = int(canvas.cget("height"))
-        if len(values) > width:
+        draw_width = max(2, round((width - 2) * max(0.0, min(1.0, progress))))
+        if len(values) > draw_width:
             values = [
-                values[round(index * (len(values) - 1) / (width - 1))]
-                for index in range(width)
+                values[round(index * (len(values) - 1) / (draw_width - 1))]
+                for index in range(draw_width)
             ]
         color_key = "flat"
         if values[-1] > values[0]:
@@ -1315,20 +1347,22 @@ class TickerApp:
             color_key = "down"
         color = self.trend_color(color_key)
         if len(values) == 1:
-            canvas.create_line(2, height // 2, width - 2, height // 2, fill=color, width=1)
+            canvas.create_line(1, height // 2, draw_width, height // 2, fill=color, width=1)
             return
         low = min(values)
         high = max(values)
         span = high - low
         points = []
         for index, value in enumerate(values):
-            x = 1 + index * (width - 2) / (len(values) - 1)
+            x = 1 + index * (draw_width - 1) / (len(values) - 1)
             y = height / 2 if span == 0 else 1 + (high - value) * (height - 2) / span
             points.extend((x, y))
         canvas.create_line(*points, fill=color, width=1, smooth=True)
 
     def trend_color(self, color_key: str) -> str:
-        color = self.text_color(color_key)
+        color = self.settings[color_key]
+        if is_no_color(color):
+            return self.display_background()
         background = self.settings["background"]
         if is_no_color(background):
             return color
