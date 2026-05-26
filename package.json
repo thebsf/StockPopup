@@ -1,0 +1,41 @@
+{
+  "name": "desktop-market-ticker",
+  "version": "1.0.0",
+  "description": "桌面实时行情窗：纽约金、国内金价、指数、原油、汇率",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win portable"
+  },
+  "keywords": [
+    "gold",
+    "nasdaq",
+    "ticker",
+    "desktop"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^30.5.1",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.local.desktop-market-ticker",
+    "productName": "桌面实时行情",
+    "directories": {
+      "output": "release"
+    },
+    "asar": false,
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        "portable"
+      ]
+    }
+  }
+}

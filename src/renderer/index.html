@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>桌面实时行情</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="ticker-shell">
+      <header class="titlebar">
+        <div class="drag-region">
+          <span class="brand-mark"></span>
+          <div>
+            <h1>实时行情</h1>
+            <p id="statusText">正在连接行情源</p>
+          </div>
+        </div>
+        <nav class="window-actions" aria-label="窗口操作">
+          <button id="refreshButton" class="icon-button" type="button" title="刷新">↻</button>
+          <button id="pinButton" class="icon-button active" type="button" title="置顶">⌖</button>
+          <button id="minimizeButton" class="icon-button" type="button" title="最小化">−</button>
+          <button id="closeButton" class="icon-button danger" type="button" title="退出">×</button>
+        </nav>
+      </header>
+
+      <section id="quoteList" class="quote-list" aria-live="polite"></section>
+
+      <footer class="footer-line">
+        <span id="updatedAt">--</span>
+        <span id="latency">--</span>
+      </footer>
+    </main>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>
