@@ -24,6 +24,17 @@ NO_COLOR_VALUES = {"", "none", "transparent", "null", "无", "无颜色"}
 SINGLE_INSTANCE_MUTEX_NAME = r"Local\DesktopMarketTicker.SingleInstance"
 ERROR_ALREADY_EXISTS = 183
 INSTANCE_MUTEX_HANDLE = None
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
 
 DEFAULT_SETTINGS = {
     "width": 282,
@@ -962,15 +973,58 @@ def save_settings(settings: dict) -> None:
         json.dump(normalize_settings(settings), file, ensure_ascii=False, indent=2)
 
 
+def enable_per_monitor_dpi_awareness() -> None:
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            pass
+
+
+def geometry_offset(x: int, y: int) -> str:
+    return f"+{int(x)}+{int(y)}"
+
+
+def virtual_screen_bounds() -> tuple[int, int, int, int]:
+    try:
+        user32 = ctypes.windll.user32
+        left = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        top = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        width = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        height = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        if width > 0 and height > 0:
+            return left, top, left + width, top + height
+    except (AttributeError, OSError):
+        pass
+    return 0, 0, 1920, 1080
+
+
+def clamp_window_position(x: int, y: int, width: int, height: int) -> tuple[int, int]:
+    left, top, right, bottom = virtual_screen_bounds()
+    visible = 40
+    return (
+        max(left - width + visible, min(int(x), right - visible)),
+        max(top - height + visible, min(int(y), bottom - visible)),
+    )
+
+
 class TickerApp:
     def __init__(self) -> None:
         self.settings = load_settings()
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title("桌面实时行情")
+        initial_x, initial_y = clamp_window_position(
+            self.settings["window_x"],
+            self.settings["window_y"],
+            self.settings["width"],
+            self.settings["height"],
+        )
         self.root.geometry(
             f"{self.settings['width']}x{self.settings['height']}"
-            f"{self.settings['window_x']:+d}{self.settings['window_y']:+d}"
+            f"{geometry_offset(initial_x, initial_y)}"
         )
         self.root.minsize(220, 90)
         self.root.configure(bg=TRANSPARENT_COLOR)
@@ -991,6 +1045,10 @@ class TickerApp:
         self.bg_root.bind("<B1-Motion>", self.drag_background_pointer)
         self.bg_root.bind("<ButtonRelease-1>", self.finish_background_pointer)
         self.bg_root.bind("<Double-Button-1>", lambda _event: self.request_refresh())
+        self.root.bind("<Map>", self.request_layer_sync)
+        self.root.bind("<Visibility>", self.request_layer_sync)
+        self.bg_root.bind("<Map>", self.request_layer_sync)
+        self.bg_root.bind("<Visibility>", self.request_layer_sync)
 
         self.drag_start = (0, 0)
         self.drag_mode = "move"
@@ -1013,6 +1071,7 @@ class TickerApp:
         self.locked = False
         self.position_restored = False
         self.starting = True
+        self.layer_sync_job: str | None = None
 
         self.font_title = font.Font(family="Microsoft YaHei UI", size=self.settings["font_size"])
         self.font_small = font.Font(family="Microsoft YaHei UI", size=max(6, self.settings["font_size"] - 1))
@@ -1021,8 +1080,10 @@ class TickerApp:
         self.build_ui()
         self.apply_settings()
         self.starting = False
-        self.root.deiconify()
         self.root.update_idletasks()
+        self.apply_tool_window_style(self.root)
+        self.apply_tool_window_style(self.bg_root)
+        self.root.deiconify()
         self.sync_background_window()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.bg_root.protocol("WM_DELETE_WINDOW", self.close)
@@ -1191,7 +1252,8 @@ class TickerApp:
             window_x = self.settings["window_x"]
             window_y = self.settings["window_y"]
             self.position_restored = True
-        self.root.geometry(f"{width}x{height}{window_x:+d}{window_y:+d}")
+        window_x, window_y = clamp_window_position(window_x, window_y, width, height)
+        self.root.geometry(f"{width}x{height}{geometry_offset(window_x, window_y)}")
         background = self.display_background()
         self.root.configure(bg=background)
         self.root.attributes("-alpha", 1.0)
@@ -1245,22 +1307,109 @@ class TickerApp:
     def display_background(self) -> str:
         return TRANSPARENT_COLOR
 
+    def window_handle(self, window: tk.Toplevel | tk.Tk) -> int:
+        window.update_idletasks()
+        hwnd = int(window.winfo_id())
+        try:
+            get_parent = ctypes.windll.user32.GetParent
+            get_parent.argtypes = [ctypes.c_void_p]
+            get_parent.restype = ctypes.c_void_p
+            parent = int(get_parent(ctypes.c_void_p(hwnd)) or 0)
+            return parent or hwnd
+        except (AttributeError, OSError):
+            return hwnd
+
+    def apply_tool_window_style(self, window: tk.Toplevel | tk.Tk) -> None:
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = self.window_handle(window)
+            get_style = user32.GetWindowLongPtrW if hasattr(user32, "GetWindowLongPtrW") else user32.GetWindowLongW
+            set_style = user32.SetWindowLongPtrW if hasattr(user32, "SetWindowLongPtrW") else user32.SetWindowLongW
+            get_style.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            get_style.restype = ctypes.c_ssize_t
+            set_style.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+            set_style.restype = ctypes.c_ssize_t
+            user32.SetWindowPos.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint,
+            ]
+            user32.SetWindowPos.restype = ctypes.c_bool
+            style = get_style(ctypes.c_void_p(hwnd), GWL_EXSTYLE)
+            set_style(ctypes.c_void_p(hwnd), GWL_EXSTYLE, (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW)
+            user32.SetWindowPos(
+                ctypes.c_void_p(hwnd),
+                ctypes.c_void_p(0),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+        except (AttributeError, OSError, tk.TclError):
+            pass
+
     def sync_background_window(self) -> None:
         if self.starting or self.is_background_transparent():
             self.bg_root.withdraw()
             return
         self.root.update_idletasks()
+        self.apply_tool_window_style(self.root)
+        self.apply_tool_window_style(self.bg_root)
         self.bg_root.configure(bg=self.settings["background"])
         self.bg_root.geometry(
-            f"{self.root.winfo_width()}x{self.root.winfo_height()}+{self.root.winfo_x()}+{self.root.winfo_y()}"
+            f"{self.root.winfo_width()}x{self.root.winfo_height()}"
+            f"{geometry_offset(self.root.winfo_x(), self.root.winfo_y())}"
         )
         self.bg_root.attributes("-alpha", self.settings["background_opacity"])
         self.bg_root.attributes("-topmost", self.settings["always_on_top"])
         self.bg_root.deiconify()
         self.keep_background_behind()
 
+    def request_layer_sync(self, _event=None) -> None:
+        if self.starting or self.layer_sync_job is not None:
+            return
+        self.layer_sync_job = self.root.after_idle(self.restore_window_layers)
+
+    def restore_window_layers(self) -> None:
+        self.layer_sync_job = None
+        try:
+            if self.root.state() != "normal":
+                return
+            self.apply_tool_window_style(self.root)
+            self.sync_background_window()
+        except tk.TclError:
+            pass
+
     def keep_background_behind(self) -> None:
-        if self.bg_root.winfo_exists() and self.root.winfo_exists():
+        if not (self.bg_root.winfo_exists() and self.root.winfo_exists()):
+            return
+        try:
+            set_window_pos = ctypes.windll.user32.SetWindowPos
+            set_window_pos.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint,
+            ]
+            set_window_pos.restype = ctypes.c_bool
+            set_window_pos(
+                ctypes.c_void_p(self.window_handle(self.bg_root)),
+                ctypes.c_void_p(self.window_handle(self.root)),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        except (AttributeError, OSError, tk.TclError):
             self.bg_root.lower(self.root)
 
     def text_color(self, key: str) -> str:
@@ -1929,9 +2078,11 @@ class TickerApp:
             return
         x = event.x_root - self.drag_start[0]
         y = event.y_root - self.drag_start[1]
-        self.root.geometry(f"+{x}+{y}")
+        self.root.geometry(geometry_offset(x, y))
         if not self.is_background_transparent():
-            self.bg_root.geometry(f"{self.root.winfo_width()}x{self.root.winfo_height()}+{x}+{y}")
+            self.bg_root.geometry(
+                f"{self.root.winfo_width()}x{self.root.winfo_height()}{geometry_offset(x, y)}"
+            )
             self.keep_background_behind()
 
     def start_resize(self, event) -> None:
@@ -1978,7 +2129,9 @@ class TickerApp:
         height = max(90, min(1000, start_height + event.y_root - start_y))
         self.root.geometry(f"{width}x{height}")
         if not self.is_background_transparent():
-            self.bg_root.geometry(f"{width}x{height}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+            self.bg_root.geometry(
+                f"{width}x{height}{geometry_offset(self.root.winfo_x(), self.root.winfo_y())}"
+            )
             self.keep_background_behind()
 
     def finish_resize(self, _event) -> None:
@@ -2003,6 +2156,12 @@ class TickerApp:
             except tk.TclError:
                 pass
             self.refresh_job = None
+        if self.layer_sync_job is not None:
+            try:
+                self.root.after_cancel(self.layer_sync_job)
+            except tk.TclError:
+                pass
+            self.layer_sync_job = None
         for window in (self.settings_window, self.bg_root, self.root):
             try:
                 if window is not None and window.winfo_exists():
@@ -2021,6 +2180,8 @@ class TickerApp:
                 pass
 
 
+if __name__ == "__main__":
+    enable_per_monitor_dpi_awareness()
 if __name__ == "__main__" and acquire_single_instance():
     try:
         TickerApp().run()
