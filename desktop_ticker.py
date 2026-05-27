@@ -7,7 +7,7 @@ import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from tkinter import colorchooser, font, ttk
 from urllib.error import URLError, HTTPError
@@ -48,14 +48,15 @@ DEFAULT_SETTINGS = {
     "price_decimals": 2,
     "refresh_seconds": 30,
     "always_on_top": True,
-    "a_stock_codes": [],
+    "sina_codes": [],
+    "removed_preset_keys": [],
     "quote_order": ["xau", "cn", "nq", "sh", "star", "oil", "usd", "jpy"],
     "quote_visible": ["xau", "cn", "nq", "sh", "star", "oil", "usd", "jpy"],
 }
 
 BASE_QUOTE_DEFS = {
     "xau": {"name": "纽约金", "symbol": "hf_GC"},
-    "cn": {"name": "国内金价", "symbol": "SGE_AUTD"},
+    "cn": {"name": "沪金99", "symbol": "SGE_AU9999"},
     "nq": {"name": "纳指期货", "symbol": "hf_NQ"},
     "sh": {"name": "上证指数", "symbol": "sh000001"},
     "star": {"name": "科创50", "symbol": "sh000688"},
@@ -64,7 +65,7 @@ BASE_QUOTE_DEFS = {
     "jpy": {"name": "日元汇率", "symbol": "fx_sjpycny"},
 }
 QUOTE_DEFS = dict(BASE_QUOTE_DEFS)
-STOCK_KEY_PREFIX = "a_stock:"
+CUSTOM_KEY_PREFIX = "custom:"
 GLOBAL_TREND_SYMBOLS = {"xau": "GC", "nq": "NQ", "oil": "CL"}
 
 
@@ -182,46 +183,180 @@ def normalize_a_stock_code(value) -> str:
     return f"sh{code}" if code.startswith("6") else f"sz{code}"
 
 
-def normalize_a_stock_codes(value) -> list[str]:
+def normalize_sina_code(value) -> str:
+    code = str(value or "").strip().replace(" ", "")
+    if not code:
+        return ""
+    aliases = {
+        "NKY": "znb_NKY",
+        "HSTECH": "rt_hkHSTECH",
+        "HSKTECH": "rt_hkHSTECH",
+    }
+    if code.upper() in aliases:
+        return aliases[code.upper()]
+    dotted = re.fullmatch(r"([A-Za-z]+)\.(.+)", code)
+    if dotted:
+        market, market_code = dotted.groups()
+        market = market.upper()
+        if market == "US":
+            return f"gb_{market_code.lstrip('$').lstrip('.').lower()}"
+        if market == "HK":
+            return f"rt_hk{market_code.upper()}"
+        if market in {"SH", "SZ", "BJ"} and re.fullmatch(r"\d{6}", market_code):
+            return f"{market.lower()}{market_code}"
+        if market == "CN":
+            return normalize_a_stock_code(market_code)
+        if market == "SGE":
+            return f"SGE_{market_code.upper()}"
+        if market in {"HF", "NF"}:
+            return f"{market.lower()}_{market_code.upper()}"
+        if market == "FX":
+            return f"fx_{market_code.lower()}"
+    stock_code = normalize_a_stock_code(code)
+    if stock_code:
+        return stock_code
+    upper = code.upper()
+    lower = code.lower()
+    if upper in {"AU9999", "AUTD"}:
+        return f"SGE_{upper}"
+    if lower.startswith("sge_"):
+        return f"SGE_{code[4:].upper()}"
+    if lower.startswith(("hf_", "nf_")):
+        return f"{lower[:3]}{code[3:].upper()}"
+    if lower.startswith("fx_"):
+        return lower
+    if lower.startswith("rt_hk"):
+        return f"rt_hk{code[5:].upper()}"
+    if lower.startswith("hk"):
+        return f"hk{code[2:].upper()}"
+    if lower.startswith("znb_"):
+        return f"znb_{code[4:].upper()}"
+    if lower.startswith(("gb_", "usr_")):
+        return lower
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{1,30}", code):
+        return code
+    return ""
+
+
+def normalize_sina_codes(value) -> list[str]:
     if isinstance(value, list):
         raw_codes = value
     else:
         raw_codes = re.split(r"[\s,，;；]+", str(value or ""))
     codes: list[str] = []
     for raw_code in raw_codes:
-        code = normalize_a_stock_code(raw_code)
+        code = normalize_sina_code(raw_code)
         if code and code not in codes:
             codes.append(code)
     return codes
 
 
-def display_a_stock_codes(value) -> str:
-    return ", ".join(code[2:] for code in normalize_a_stock_codes(value))
+def suggestion_symbol(fields: list[str]) -> str:
+    if len(fields) < 4:
+        return ""
+    market_type = fields[1]
+    code = fields[2]
+    backend = fields[3]
+    if market_type in {"11", "12"}:
+        return backend
+    if market_type == "31":
+        return f"rt_hk{code.upper()}"
+    if market_type == "33":
+        return f"rt_hk{code.upper()}"
+    if market_type == "41":
+        return f"gb_{code.lstrip('.').lower()}"
+    if market_type == "86":
+        return f"hf_{code.upper()}"
+    if market_type == "87":
+        return f"nf_{code.upper()}"
+    return backend
 
 
-def stock_quote_key(symbol: str) -> str:
-    return f"{STOCK_KEY_PREFIX}{symbol}"
+def fetch_sina_suggestions(query: str) -> list[list[str]]:
+    url = f"https://suggest3.sinajs.cn/suggest/type=&key={quote(query)}"
+    text = http_get(url, "gbk")
+    match = re.search(r'="(.*)"\s*;?\s*$', text, re.S)
+    if not match or not match.group(1):
+        return []
+    return [item.split(",") for item in match.group(1).split(";") if item]
 
 
-def stock_symbol_from_key(key: str) -> str:
-    return key.removeprefix(STOCK_KEY_PREFIX)
+def quote_symbol_has_data(symbol: str) -> bool:
+    text = http_get(f"https://hq.sinajs.cn/list={symbol}", "gbk")
+    assignments = parse_sina_assignments(text)
+    return bool(assignments.get(symbol))
 
 
-def sync_quote_defs(a_stock_codes: list[str]) -> None:
+def resolve_sina_code(value) -> str:
+    raw = str(value or "").strip()
+    normalized = normalize_sina_code(raw)
+    direct_backend = re.match(r"^(?:sh|sz|bj|SGE_|hf_|nf_|fx_|rt_hk|hk|gb_|usr_|znb_)", normalized, re.I)
+    if direct_backend:
+        return normalized
+    try:
+        suggestions = fetch_sina_suggestions(raw)
+        lower_raw = raw.lower()
+        preferred = [
+            fields for fields in suggestions
+            if any(lower_raw == str(field).lower() for field in fields[:7])
+        ]
+        for fields in preferred or suggestions[:1]:
+            symbol = suggestion_symbol(fields)
+            if symbol and quote_symbol_has_data(symbol):
+                return symbol
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9._$-]{1,30}", raw):
+            upper = raw.upper()
+            candidates = [
+                f"znb_{upper}",
+                f"hf_{upper}",
+                f"rt_hk{upper}",
+                f"gb_{raw.lstrip('.').lower()}",
+            ]
+            for symbol in candidates:
+                if quote_symbol_has_data(symbol):
+                    return symbol
+    except (HTTPError, URLError, TimeoutError):
+        pass
+    return normalized
+
+
+def resolve_sina_codes(value) -> list[str]:
+    if isinstance(value, list):
+        raw_codes = value
+    else:
+        raw_codes = re.split(r"[,，;；\n]+", str(value or ""))
+    codes: list[str] = []
+    for raw_code in raw_codes:
+        code = resolve_sina_code(raw_code)
+        if code and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def custom_quote_key(symbol: str) -> str:
+    return f"{CUSTOM_KEY_PREFIX}{symbol}"
+
+
+def custom_symbol_from_key(key: str) -> str:
+    return key.removeprefix(CUSTOM_KEY_PREFIX)
+
+
+def sync_quote_defs(sina_codes: list[str]) -> None:
     QUOTE_DEFS.clear()
-    for code in a_stock_codes:
-        QUOTE_DEFS[stock_quote_key(code)] = {"name": "自选A股", "symbol": code}
+    for code in sina_codes:
+        QUOTE_DEFS[custom_quote_key(code)] = {"name": "自选行情", "symbol": code}
     QUOTE_DEFS.update(BASE_QUOTE_DEFS)
 
 
-def parse_china_gold(values: list[str]) -> Quote:
+def parse_sina_sge(values: list[str], name: str, symbol: str) -> Quote:
     price = as_float(values[3] if len(values) > 3 else None)
     previous_close = as_float(values[9] if len(values) > 9 else None)
     percent = as_float(values[17] if len(values) > 17 else None)
     if price is None:
-        raise RuntimeError("国内金价为空")
+        raise RuntimeError(f"{name}价格为空")
     change = price - previous_close if previous_close is not None else None
-    return Quote("国内金价", "SGE_AUTD", price, change, percent, "CNY/g", "新浪")
+    quote_name = name or (values[1].replace(" ", "") if len(values) > 1 else symbol)
+    return Quote(quote_name, symbol, price, change, percent, "CNY/g", "新浪")
 
 
 def parse_sina_index(values: list[str], key: str, name: str, symbol: str) -> Quote:
@@ -235,14 +370,14 @@ def parse_sina_index(values: list[str], key: str, name: str, symbol: str) -> Quo
 
 
 def parse_sina_a_stock(values: list[str], symbol: str) -> Quote:
-    name = values[0] if values else "自选A股"
+    name = values[0] if values else "自选行情"
     price = as_float(values[3] if len(values) > 3 else None)
     previous_close = as_float(values[2] if len(values) > 2 else None)
     if price is None:
-        raise RuntimeError("自选A股价格为空，请检查代码")
+        raise RuntimeError("行情价格为空，请检查新浪代码")
     change = price - previous_close if previous_close is not None else None
     percent = (change / previous_close * 100) if change is not None and previous_close else None
-    return Quote(name or "自选A股", symbol, price, change, percent, "元", "新浪")
+    return Quote(name or "自选行情", symbol, price, change, percent, "元", "新浪")
 
 
 def parse_sina_global_future(values: list[str], name: str, symbol: str, unit: str) -> Quote:
@@ -252,7 +387,10 @@ def parse_sina_global_future(values: list[str], name: str, symbol: str, unit: st
         raise RuntimeError(f"{name}价格为空")
     change = price - previous_close if previous_close is not None else None
     percent = (change / previous_close * 100) if change is not None and previous_close else None
-    return Quote(name, symbol, price, change, percent, unit, "新浪")
+    quote_name = name
+    if name == symbol and len(values) > 13 and values[13]:
+        quote_name = values[13]
+    return Quote(quote_name, symbol, price, change, percent, unit, "新浪")
 
 
 def parse_sina_fx(values: list[str], name: str, symbol: str) -> Quote:
@@ -262,7 +400,64 @@ def parse_sina_fx(values: list[str], name: str, symbol: str) -> Quote:
     if price is None:
         raise RuntimeError(f"{name}价格为空")
     change = price - previous_close if previous_close is not None else None
-    return Quote(name, symbol, price, change, percent, "CNY", "新浪", decimals=4)
+    quote_name = values[9] if name == symbol and len(values) > 9 and values[9] else name
+    return Quote(quote_name, symbol, price, change, percent, "CNY", "新浪", decimals=4)
+
+
+def parse_sina_inner_future(values: list[str], name: str, symbol: str) -> Quote:
+    quote_name = values[0] if values else name
+    price = as_float(values[6] if len(values) > 6 else None)
+    previous_close = as_float(values[10] if len(values) > 10 else None)
+    if price is None:
+        raise RuntimeError(f"{name}价格为空")
+    change = price - previous_close if previous_close is not None else None
+    percent = (change / previous_close * 100) if change is not None and previous_close else None
+    return Quote(quote_name or name, symbol, price, change, percent, "CNY", "新浪")
+
+
+def parse_sina_hk(values: list[str], symbol: str) -> Quote:
+    name = values[1] if len(values) > 1 and values[1] else symbol
+    price = as_float(values[6] if len(values) > 6 else None)
+    change = as_float(values[7] if len(values) > 7 else None)
+    percent = as_float(values[8] if len(values) > 8 else None)
+    if price is None:
+        raise RuntimeError(f"{name}价格为空")
+    return Quote(name, symbol, price, change, percent, "HKD", "新浪")
+
+
+def parse_sina_us(values: list[str], symbol: str) -> Quote:
+    name = values[0] if values and values[0] else symbol
+    price = as_float(values[1] if len(values) > 1 else None)
+    percent = as_float(values[2] if len(values) > 2 else None)
+    change = as_float(values[4] if len(values) > 4 else None)
+    if price is None:
+        raise RuntimeError(f"{name}价格为空")
+    return Quote(name, symbol, price, change, percent, "USD", "新浪")
+
+
+def parse_sina_global_index(values: list[str], symbol: str) -> Quote:
+    name = values[0] if values else symbol
+    price = as_float(values[1] if len(values) > 1 else None)
+    change = as_float(values[2] if len(values) > 2 else None)
+    percent = as_float(values[3] if len(values) > 3 else None)
+    if price is None:
+        raise RuntimeError(f"{name}价格为空")
+    return Quote(name, symbol, price, change, percent, "点", "新浪")
+
+
+def china_trading_progress(moment: datetime) -> float:
+    minutes = moment.hour * 60 + moment.minute
+    if minutes <= 9 * 60 + 30:
+        completed = 0
+    elif minutes <= 11 * 60 + 30:
+        completed = minutes - (9 * 60 + 30)
+    elif minutes < 13 * 60:
+        completed = 120
+    elif minutes <= 15 * 60:
+        completed = 120 + minutes - 13 * 60
+    else:
+        completed = 240
+    return max(0.0, min(1.0, completed / 240))
 
 
 def fetch_sina_intraday_trend(symbol: str) -> tuple[list[float], float]:
@@ -272,12 +467,23 @@ def fetch_sina_intraday_trend(symbol: str) -> tuple[list[float], float]:
     )
     data = json.loads(http_get(url, "utf-8", {"Accept": "application/json"}))
     values = data.get("result", {}).get("data") or []
+    today = datetime.now().strftime("%Y-%m-%d")
+    values = [
+        item for item in values
+        if isinstance(item, dict) and str(item.get("day", "")).startswith(today)
+    ]
     trend = [
         value
         for item in values
         if isinstance(item, dict) and (value := as_float(item.get("close"))) is not None
     ]
-    return trend, min(1.0, len(trend) / 48)
+    if not values:
+        return [], 0.0
+    try:
+        latest = datetime.strptime(str(values[-1]["day"]), "%Y-%m-%d %H:%M:%S")
+    except (KeyError, TypeError, ValueError):
+        return trend, min(1.0, len(trend) / 48)
+    return trend, china_trading_progress(latest)
 
 
 def fetch_sina_global_intraday_trend(symbol: str) -> tuple[list[float], float]:
@@ -299,14 +505,202 @@ def fetch_sina_global_intraday_trend(symbol: str) -> tuple[list[float], float]:
     if not values:
         return trend, 0.0
     try:
+        first = datetime.strptime(values[0][-1], "%Y-%m-%d %H:%M:%S")
         latest = datetime.strptime(values[-1][-1], "%Y-%m-%d %H:%M:%S")
     except (IndexError, TypeError, ValueError):
         return trend, 1.0
-    session_start = latest.replace(hour=6, minute=0, second=0, microsecond=0)
-    if latest < session_start:
-        session_start -= timedelta(days=1)
-    progress = (latest - session_start).total_seconds() / (23 * 60 * 60)
+    progress = (latest - first).total_seconds() / (23 * 60 * 60)
     return trend, max(0.0, min(1.0, progress))
+
+
+def fetch_sina_inner_intraday_trend(symbol: str) -> tuple[list[float], float]:
+    contract = symbol.removeprefix("nf_")
+    url = (
+        "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_data=/"
+        f"InnerFuturesNewService.getMinLine?symbol={quote(contract)}"
+    )
+    text = http_get(url, "utf-8", {"Accept": "application/json"})
+    match = re.search(r"var\s+_data=\((.*)\)\s*;?\s*$", text, re.S)
+    if not match:
+        return [], 0.0
+    values = json.loads(match.group(1)) or []
+    trend = [
+        value
+        for item in values
+        if isinstance(item, list) and len(item) > 1 and (value := as_float(item[1])) is not None
+    ]
+    # Domestic futures trading calendars vary by contract; use returned minute
+    # count conservatively instead of presenting an incomplete line as full day.
+    return trend, min(1.0, max(0.02, len(trend) / 555)) if trend else 0.0
+
+
+def fetch_sina_us_intraday_trend(symbol: str) -> tuple[list[float], float]:
+    url = (
+        "https://stock.finance.sina.com.cn/usstock/api/jsonp.php/var%20_data=/"
+        f"US_MinlineService.getMinline?symbol={quote(symbol)}"
+    )
+    text = http_get(url, "utf-8", {"Accept": "application/json"})
+    match = re.search(r"var\s+_data=\((.*)\)\s*;?\s*$", text, re.S)
+    if not match:
+        return [], 0.0
+    data = json.loads(match.group(1))
+    sessions = data.get("minline_1") or []
+    if not sessions:
+        return [], 0.0
+    latest_session = sessions[-1]
+    first = latest_session.get("first_min") or []
+    other = latest_session.get("other_min") or []
+    trend: list[float] = []
+    if len(first) > 3 and (value := as_float(first[3])) is not None:
+        trend.append(value)
+    trend.extend(
+        value for item in other
+        if isinstance(item, list) and item and (value := as_float(item[0])) is not None
+    )
+    return trend, min(1.0, len(trend) / 391) if trend else 0.0
+
+
+def fetch_sina_forex_intraday_trend(symbol: str) -> tuple[list[float], float]:
+    url = (
+        "https://vip.stock.finance.sina.com.cn/forex/api/jsonp.php/var%20_data=/"
+        f"NewForexService.getMinKline?symbol={quote(symbol)}&scale=1&datalen=1440"
+    )
+    text = http_get(url, "utf-8", {"Accept": "application/json"})
+    match = re.search(r"var\s+_data\s*=\s*\((.*)\)\s*;?\s*$", text, re.S)
+    if not match:
+        return [], 0.0
+    values = json.loads(match.group(1)) or []
+    today = datetime.now().strftime("%Y-%m-%d")
+    values = [
+        item for item in values
+        if isinstance(item, dict) and str(item.get("d", "")).startswith(today)
+    ]
+    trend = [
+        value
+        for item in values
+        if (value := as_float(item.get("c"))) is not None
+    ]
+    if not values:
+        return [], 0.0
+    try:
+        latest = datetime.strptime(str(values[-1]["d"]), "%Y-%m-%d %H:%M:%S")
+    except (KeyError, TypeError, ValueError):
+        return trend, 0.0
+    progress = (latest.hour * 60 + latest.minute) / (24 * 60)
+    return trend, max(0.0, min(1.0, progress))
+
+
+def trading_session_progress(latest_time: str, sessions: list[list[str]]) -> float:
+    try:
+        latest = datetime.strptime(latest_time, "%H:%M:%S").hour * 60 + datetime.strptime(
+            latest_time, "%H:%M:%S"
+        ).minute
+    except ValueError:
+        try:
+            latest = datetime.strptime(latest_time, "%H:%M").hour * 60 + datetime.strptime(
+                latest_time, "%H:%M"
+            ).minute
+        except ValueError:
+            return 0.0
+    ranges: list[tuple[int, int]] = []
+    for start_text, end_text in sessions:
+        try:
+            start = datetime.strptime(start_text, "%H:%M").hour * 60 + datetime.strptime(
+                start_text, "%H:%M"
+            ).minute
+            end = datetime.strptime(end_text, "%H:%M").hour * 60 + datetime.strptime(
+                end_text, "%H:%M"
+            ).minute
+        except ValueError:
+            continue
+        ranges.append((start, end))
+    total = sum(end - start + 1 for start, end in ranges)
+    if total <= 0:
+        return 0.0
+    completed = 0
+    for start, end in ranges:
+        if latest < start:
+            break
+        completed += min(latest, end) - start + 1
+        if latest <= end:
+            break
+    return max(0.0, min(1.0, completed / total))
+
+
+def fetch_sina_hk_intraday_trend(symbol: str) -> tuple[list[float], float]:
+    code = re.sub(r"^(?:rt_)?hk", "", symbol, flags=re.I)
+    url = (
+        "https://stock.finance.sina.com.cn/hkstock/api/jsonp_v2.php/var%20_data=/"
+        f"HK_StockService.getHKMinline?symbol={quote(code)}"
+    )
+    text = http_get(url, "utf-8", {"Accept": "application/json"})
+    match = re.search(r"var\s+_data\s*=\s*\((.*)\)\s*;?\s*$", text, re.S)
+    if not match:
+        return [], 0.0
+    values = json.loads(match.group(1)) or []
+    trend = [
+        value
+        for item in values
+        if isinstance(item, dict) and (value := as_float(item.get("p"))) is not None
+    ]
+    if not values:
+        return [], 0.0
+    progress = trading_session_progress(
+        str(values[-1].get("m", "")),
+        [["09:30", "11:59"], ["13:00", "16:00"]],
+    )
+    return trend, progress
+
+
+def fetch_sina_global_index_intraday_trend(symbol: str) -> tuple[list[float], float]:
+    code = re.sub(r"^znb_", "", symbol, flags=re.I)
+    min_url = f"https://gi.finance.sina.com.cn/hq/min?symbol={quote(code)}"
+    time_url = f"https://gi.finance.sina.com.cn/hq/time?symbol={quote(code)}"
+    data = json.loads(http_get(min_url, "utf-8", {"Accept": "application/json"}))
+    values = data.get("result", {}).get("data") or []
+    trend = [
+        value
+        for item in values
+        if isinstance(item, list) and len(item) > 1 and (value := as_float(item[1])) is not None
+    ]
+    if not values:
+        return [], 0.0
+    sessions_data = json.loads(http_get(time_url, "utf-8", {"Accept": "application/json"}))
+    sessions = sessions_data.get("result", {}).get("data", {}).get("time") or []
+    progress = trading_session_progress(str(values[-1][0]), sessions)
+    return trend, progress
+
+
+def quote_trend_type(symbol: str) -> tuple[str, str] | None:
+    lower = symbol.lower()
+    if lower.startswith(("sh", "sz", "bj")):
+        return "cn", symbol
+    if lower.startswith("hf_"):
+        return "global", symbol[3:].upper()
+    if lower.startswith("nf_"):
+        return "inner", symbol
+    if lower.startswith(("gb_", "usr_")):
+        code = symbol.split("_", 1)[1].lstrip("$")
+        us_index_codes = {"ixic", "dji", "ndx", "inx"}
+        return "us", f".{code.upper()}" if code.lower() in us_index_codes else code.upper()
+    if lower.startswith("fx_"):
+        return "forex", symbol
+    if lower.startswith(("hk", "rt_hk")):
+        return "hk", symbol
+    if lower.startswith("znb_"):
+        return "global_index", symbol
+    if lower.startswith("sge_"):
+        return "cn", symbol
+    return None
+
+
+def fallback_trend_span_seconds(symbol: str) -> int:
+    lower = symbol.lower()
+    if lower.startswith("sge_"):
+        return 11 * 60 * 60
+    if lower.startswith(("sh", "sz", "bj")):
+        return 4 * 60 * 60
+    return 23 * 60 * 60
 
 
 def fetch_sina_trends(keys: list[str]) -> dict[str, tuple[list[float], float]]:
@@ -316,10 +710,26 @@ def fetch_sina_trends(keys: list[str]) -> dict[str, tuple[list[float], float]]:
         if definition is None:
             continue
         try:
+            trend_type = quote_trend_type(definition["symbol"])
             if key in GLOBAL_TREND_SYMBOLS:
-                values, progress = fetch_sina_global_intraday_trend(GLOBAL_TREND_SYMBOLS[key])
+                trend_type = ("global", GLOBAL_TREND_SYMBOLS[key])
+            if trend_type is None:
+                continue
+            kind, symbol = trend_type
+            if kind == "global":
+                values, progress = fetch_sina_global_intraday_trend(symbol)
+            elif kind == "inner":
+                values, progress = fetch_sina_inner_intraday_trend(symbol)
+            elif kind == "us":
+                values, progress = fetch_sina_us_intraday_trend(symbol)
+            elif kind == "forex":
+                values, progress = fetch_sina_forex_intraday_trend(symbol)
+            elif kind == "hk":
+                values, progress = fetch_sina_hk_intraday_trend(symbol)
+            elif kind == "global_index":
+                values, progress = fetch_sina_global_index_intraday_trend(symbol)
             else:
-                values, progress = fetch_sina_intraday_trend(definition["symbol"])
+                values, progress = fetch_sina_intraday_trend(symbol)
         except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError):
             continue
         if values:
@@ -327,18 +737,37 @@ def fetch_sina_trends(keys: list[str]) -> dict[str, tuple[list[float], float]]:
     return trends
 
 
+def parse_custom_sina_quote(values: list[str], symbol: str) -> Quote:
+    lower = symbol.lower()
+    if lower.startswith("sge_"):
+        return parse_sina_sge(values, "", symbol)
+    if lower.startswith("hf_"):
+        return parse_sina_global_future(values, symbol, symbol, "USD")
+    if lower.startswith("nf_"):
+        return parse_sina_inner_future(values, symbol, symbol)
+    if lower.startswith("fx_"):
+        return parse_sina_fx(values, symbol, symbol)
+    if lower.startswith(("hk", "rt_hk")):
+        return parse_sina_hk(values, symbol)
+    if lower.startswith(("gb_", "usr_")):
+        return parse_sina_us(values, symbol)
+    if lower.startswith("znb_"):
+        return parse_sina_global_index(values, symbol)
+    return parse_sina_a_stock(values, symbol)
+
+
 def fetch_sina_quotes(
-    a_stock_codes=None,
+    sina_codes=None,
     trends: dict[str, tuple[list[float], float]] | None = None,
 ) -> dict[str, Quote]:
-    a_stock_symbols = normalize_a_stock_codes(a_stock_codes)
-    sync_quote_defs(a_stock_symbols)
-    symbols = ["hf_GC", "SGE_AUTD", "hf_NQ", "sh000001", "sh000688", "hf_CL", "fx_susdcny", "fx_sjpycny"]
-    symbols.extend(a_stock_symbols)
+    custom_symbols = normalize_sina_codes(sina_codes)
+    sync_quote_defs(custom_symbols)
+    symbols = ["hf_GC", "SGE_AU9999", "hf_NQ", "sh000001", "sh000688", "hf_CL", "fx_susdcny", "fx_sjpycny"]
+    symbols.extend(custom_symbols)
     assignments = parse_sina_assignments(http_get(f"https://hq.sinajs.cn/list={','.join(symbols)}", "gbk"))
     parsers = {
         "xau": lambda: parse_sina_global_future(assignments.get("hf_GC", []), "纽约金", "hf_GC", "USD/oz"),
-        "cn": lambda: parse_china_gold(assignments.get("SGE_AUTD", [])),
+        "cn": lambda: parse_sina_sge(assignments.get("SGE_AU9999", []), "沪金99", "SGE_AU9999"),
         "nq": lambda: parse_sina_global_future(assignments.get("hf_NQ", []), "纳指期货", "hf_NQ", "USD"),
         "sh": lambda: parse_sina_index(assignments.get("sh000001", []), "sh", "上证指数", "sh000001"),
         "star": lambda: parse_sina_index(assignments.get("sh000688", []), "star", "科创50", "sh000688"),
@@ -346,10 +775,10 @@ def fetch_sina_quotes(
         "usd": lambda: parse_sina_fx(assignments.get("fx_susdcny", []), "美元汇率", "fx_susdcny"),
         "jpy": lambda: parse_sina_fx(assignments.get("fx_sjpycny", []), "日元汇率", "fx_sjpycny"),
     }
-    for symbol in a_stock_symbols:
-        parsers[stock_quote_key(symbol)] = lambda stock_symbol=symbol: parse_sina_a_stock(
-            assignments.get(stock_symbol, []),
-            stock_symbol,
+    for symbol in custom_symbols:
+        parsers[custom_quote_key(symbol)] = lambda custom_symbol=symbol: parse_custom_sina_quote(
+            assignments.get(custom_symbol, []),
+            custom_symbol,
         )
     quotes: dict[str, Quote] = {}
     for key, parser in parsers.items():
@@ -404,27 +833,43 @@ def normalize_color(value, default: str) -> str:
     return value.lower() if re.fullmatch(r"#[0-9a-fA-F]{6}", value) else default
 
 
-def normalize_quote_order(value, first_stock_key: str = "") -> list[str]:
-    known = list(QUOTE_DEFS)
+def normalize_removed_preset_keys(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [key for key in BASE_QUOTE_DEFS if key in value]
+
+
+def normalize_quote_order(value, first_custom_key: str = "", removed_preset_keys: list[str] | None = None) -> list[str]:
+    removed = set(removed_preset_keys or [])
+    known = [key for key in QUOTE_DEFS if key not in removed]
     if not isinstance(value, list):
         value = []
     ordered = []
     for item in value:
-        key = first_stock_key if item == "a_stock" and first_stock_key else item
-        if key in QUOTE_DEFS and key not in ordered:
+        if isinstance(item, str) and item.startswith("a_stock:"):
+            item = custom_quote_key(item.removeprefix("a_stock:"))
+        if isinstance(item, str) and item.startswith(CUSTOM_KEY_PREFIX):
+            item = custom_quote_key(normalize_sina_code(custom_symbol_from_key(item)))
+        key = first_custom_key if item == "a_stock" and first_custom_key else item
+        if key in QUOTE_DEFS and key not in removed and key not in ordered:
             ordered.append(key)
     return ordered + [item for item in known if item not in ordered]
 
 
-def normalize_quote_visible(value, first_stock_key: str = "") -> list[str]:
+def normalize_quote_visible(value, first_custom_key: str = "", removed_preset_keys: list[str] | None = None) -> list[str]:
+    removed = set(removed_preset_keys or [])
     if not isinstance(value, list):
-        return list(QUOTE_DEFS)
+        return [key for key in QUOTE_DEFS if key not in removed]
     visible = []
     for item in value:
-        key = first_stock_key if item == "a_stock" and first_stock_key else item
-        if key in QUOTE_DEFS and key not in visible:
+        if isinstance(item, str) and item.startswith("a_stock:"):
+            item = custom_quote_key(item.removeprefix("a_stock:"))
+        if isinstance(item, str) and item.startswith(CUSTOM_KEY_PREFIX):
+            item = custom_quote_key(normalize_sina_code(custom_symbol_from_key(item)))
+        key = first_custom_key if item == "a_stock" and first_custom_key else item
+        if key in QUOTE_DEFS and key not in removed and key not in visible:
             visible.append(key)
-    return visible or list(QUOTE_DEFS)
+    return visible
 
 
 def normalize_settings(settings: dict) -> dict:
@@ -479,15 +924,25 @@ def normalize_settings(settings: dict) -> dict:
         600,
     )
     normalized["always_on_top"] = bool(normalized.get("always_on_top"))
-    a_stock_codes = normalize_a_stock_codes(
-        normalized.get("a_stock_codes") or normalized.get("a_stock_code")
+    normalized["removed_preset_keys"] = normalize_removed_preset_keys(normalized.get("removed_preset_keys"))
+    sina_codes = normalize_sina_codes(
+        normalized.get("sina_codes") or normalized.get("a_stock_codes") or normalized.get("a_stock_code")
     )
-    normalized["a_stock_codes"] = a_stock_codes
+    normalized["sina_codes"] = sina_codes
+    normalized.pop("a_stock_codes", None)
     normalized.pop("a_stock_code", None)
-    sync_quote_defs(a_stock_codes)
-    first_stock_key = stock_quote_key(a_stock_codes[0]) if a_stock_codes else ""
-    normalized["quote_order"] = normalize_quote_order(normalized.get("quote_order"), first_stock_key)
-    normalized["quote_visible"] = normalize_quote_visible(normalized.get("quote_visible"), first_stock_key)
+    sync_quote_defs(sina_codes)
+    first_custom_key = custom_quote_key(sina_codes[0]) if sina_codes else ""
+    normalized["quote_order"] = normalize_quote_order(
+        normalized.get("quote_order"),
+        first_custom_key,
+        normalized["removed_preset_keys"],
+    )
+    normalized["quote_visible"] = normalize_quote_visible(
+        normalized.get("quote_visible"),
+        first_custom_key,
+        normalized["removed_preset_keys"],
+    )
     for key in COLOR_KEYS:
         normalized[key] = normalize_color(normalized.get(key, DEFAULT_SETTINGS[key]), DEFAULT_SETTINGS[key])
     return normalized
@@ -549,8 +1004,10 @@ class TickerApp:
         self.sina_trends: dict[str, tuple[list[float], float]] = {}
         self.sina_trend_times: dict[str, float] = {}
         self.local_trends: dict[str, list[float]] = {}
+        self.local_trend_starts: dict[str, datetime] = {}
         self.local_trend_day = datetime.now().date()
         self.refreshing = False
+        self.refresh_pending = False
         self.refresh_job: str | None = None
         self.settings_window: tk.Toplevel | None = None
         self.locked = False
@@ -608,6 +1065,15 @@ class TickerApp:
         self.content.bind("<ButtonPress-1>", self.start_drag)
         self.content.bind("<B1-Motion>", self.drag)
         self.content.bind("<Double-Button-1>", lambda _event: self.request_refresh())
+
+        self.empty_label = tk.Label(
+            self.content,
+            text="暂无行情，请在设置中添加",
+            bg=self.settings["background"],
+            fg=self.settings["muted"],
+            font=self.font_title,
+        )
+        self.muted_widgets.append(self.empty_label)
 
         for key, definition in QUOTE_DEFS.items():
             self.rows[key] = self.create_row(self.content, definition["name"], definition["symbol"])
@@ -699,7 +1165,12 @@ class TickerApp:
     def apply_quote_visibility(self) -> None:
         for row in self.rows.values():
             row["row"].pack_forget()
-        for key in self.ordered_visible_quote_keys():
+        visible_keys = self.ordered_visible_quote_keys()
+        self.empty_label.pack_forget()
+        if not visible_keys:
+            self.empty_label.pack(anchor="w", padx=4, pady=(10, 6))
+            return
+        for key in visible_keys:
             self.rows[key]["row"].pack(fill="x", expand=True, pady=0)
 
     def ensure_quote_rows(self) -> None:
@@ -828,7 +1299,7 @@ class TickerApp:
             "price_font_size": tk.StringVar(value=str(self.settings["price_font_size"])),
             "price_decimals": tk.StringVar(value=str(self.settings["price_decimals"])),
             "refresh_seconds": tk.StringVar(value=str(self.settings["refresh_seconds"])),
-            "a_stock_codes": tk.StringVar(value=""),
+            "sina_codes": tk.StringVar(value=""),
             "always_on_top": tk.BooleanVar(value=self.settings["always_on_top"]),
         }
         colors = {
@@ -836,6 +1307,7 @@ class TickerApp:
             for key in ["background", "text", "price", "up", "down", "flat", "border"]
         }
         quote_order = list(self.settings["quote_order"])
+        removed_preset_keys = set(self.settings["removed_preset_keys"])
         quote_visible = {
             key: tk.BooleanVar(value=key in self.settings["quote_visible"])
             for key in QUOTE_DEFS
@@ -896,42 +1368,49 @@ class TickerApp:
         def apply_from_form(
             close_after: bool = False,
             refresh_quote_list: bool = True,
-            a_stock_codes_override: list[str] | None = None,
-            clear_stock_input: bool = True,
+            sina_codes_override: list[str] | None = None,
+            clear_sina_input: bool = True,
         ) -> None:
-            previous_a_stock_codes = list(self.settings["a_stock_codes"])
-            if a_stock_codes_override is None:
-                next_a_stock_codes = list(previous_a_stock_codes)
-                for code in normalize_a_stock_codes(values["a_stock_codes"].get()):
-                    if code not in next_a_stock_codes:
-                        next_a_stock_codes.append(code)
+            previous_sina_codes = list(self.settings["sina_codes"])
+            previous_removed_preset_keys = list(self.settings["removed_preset_keys"])
+            previous_visible_quotes = set(self.settings["quote_visible"])
+            if sina_codes_override is None:
+                next_sina_codes = list(previous_sina_codes)
+                for code in resolve_sina_codes(values["sina_codes"].get()):
+                    if code not in next_sina_codes:
+                        next_sina_codes.append(code)
             else:
-                next_a_stock_codes = normalize_a_stock_codes(a_stock_codes_override)
-            sync_quote_defs(next_a_stock_codes)
-            stock_keys = [stock_quote_key(code) for code in next_a_stock_codes]
-            current_stock_indexes = [
+                next_sina_codes = normalize_sina_codes(sina_codes_override)
+            sync_quote_defs(next_sina_codes)
+            custom_keys = [custom_quote_key(code) for code in next_sina_codes]
+            current_custom_indexes = [
                 index for index, key in enumerate(quote_order)
-                if key.startswith(STOCK_KEY_PREFIX) and key in stock_keys
+                if key.startswith(CUSTOM_KEY_PREFIX) and key in custom_keys
             ]
             next_order = [
                 key for key in quote_order
-                if key in QUOTE_DEFS and (not key.startswith(STOCK_KEY_PREFIX) or key in stock_keys)
+                if key in QUOTE_DEFS
+                and key not in removed_preset_keys
+                and (not key.startswith(CUSTOM_KEY_PREFIX) or key in custom_keys)
             ]
-            new_stock_keys = [key for key in stock_keys if key not in next_order]
-            insert_at = (max(current_stock_indexes) + 1) if current_stock_indexes else 0
-            for key in new_stock_keys:
+            new_custom_keys = [key for key in custom_keys if key not in next_order]
+            insert_at = (max(current_custom_indexes) + 1) if current_custom_indexes else 0
+            for key in new_custom_keys:
                 next_order.insert(insert_at, key)
                 insert_at += 1
-            quote_order[:] = next_order + [key for key in QUOTE_DEFS if key not in next_order]
+            quote_order[:] = next_order + [
+                key for key in QUOTE_DEFS
+                if key not in removed_preset_keys and key not in next_order
+            ]
             for old_key in list(quote_visible):
-                if old_key.startswith(STOCK_KEY_PREFIX) and old_key not in stock_keys:
+                if old_key.startswith(CUSTOM_KEY_PREFIX) and old_key not in custom_keys:
                     quote_visible.pop(old_key, None)
-            for key in stock_keys:
+            for key in custom_keys:
                 quote_visible.setdefault(key, tk.BooleanVar(value=True))
-            selected_quotes = [key for key, variable in quote_visible.items() if variable.get()]
-            if not selected_quotes:
-                selected_quotes = [quote_order[0]]
-                quote_visible[quote_order[0]].set(True)
+            selected_quotes = [
+                key for key, variable in quote_visible.items()
+                if variable.get() and key in quote_order
+            ]
             next_settings = {
                 **self.settings,
                 "background_opacity": clamp_float(values["background_opacity"].get(), 62, 0, 100) / 100,
@@ -941,7 +1420,8 @@ class TickerApp:
                 "price_font_size": values["price_font_size"].get(),
                 "price_decimals": values["price_decimals"].get(),
                 "refresh_seconds": values["refresh_seconds"].get(),
-                "a_stock_codes": next_a_stock_codes,
+                "sina_codes": next_sina_codes,
+                "removed_preset_keys": list(removed_preset_keys),
                 "always_on_top": values["always_on_top"].get(),
                 "quote_order": quote_order,
                 "quote_visible": selected_quotes,
@@ -950,14 +1430,20 @@ class TickerApp:
             self.settings = normalize_settings(next_settings)
             save_settings(self.settings)
             self.apply_settings()
-            if clear_stock_input:
-                values["a_stock_codes"].set("")
+            if clear_sina_input:
+                values["sina_codes"].set("")
             if self.refresh_job is not None:
                 self.root.after_cancel(self.refresh_job)
                 self.refresh_job = self.root.after(self.settings["refresh_seconds"] * 1000, self.refresh)
-            if self.settings["a_stock_codes"] != previous_a_stock_codes:
+            quote_list_changed = (
+                self.settings["sina_codes"] != previous_sina_codes
+                or self.settings["removed_preset_keys"] != previous_removed_preset_keys
+            )
+            visible_quotes_changed = set(self.settings["quote_visible"]) != previous_visible_quotes
+            if quote_list_changed:
                 if refresh_quote_list:
                     render_quote_settings()
+            if quote_list_changed or visible_quotes_changed:
                 self.refresh()
             if close_after:
                 window.destroy()
@@ -1119,18 +1605,37 @@ class TickerApp:
             if quote_key and target_key:
                 move_quote_to_target(quote_key, target_key, after_target)
 
-        def remove_a_stock(symbol: str) -> None:
-            remaining_codes = [code for code in self.settings["a_stock_codes"] if code != symbol]
+        def remove_custom_quote(symbol: str) -> None:
+            remaining_codes = [code for code in self.settings["sina_codes"] if code != symbol]
             apply_from_form(
                 False,
-                a_stock_codes_override=remaining_codes,
+                sina_codes_override=remaining_codes,
             )
+
+        def remove_quote(quote_key: str) -> None:
+            if quote_key.startswith(CUSTOM_KEY_PREFIX):
+                remove_custom_quote(custom_symbol_from_key(quote_key))
+                return
+            removed_preset_keys.add(quote_key)
+            if quote_key in quote_order:
+                quote_order.remove(quote_key)
+            quote_visible.pop(quote_key, None)
+            apply_from_form(False, refresh_quote_list=False)
+            render_quote_settings()
 
         def render_quote_settings() -> None:
             quote_row_keys.clear()
             quote_rows.clear()
             for child in quote_list_box.winfo_children():
                 child.destroy()
+            if not quote_order:
+                tk.Label(
+                    quote_list_box,
+                    text="暂无行情，请在下方添加代码或名称。",
+                    bg="#ffffff",
+                    fg="#64748b",
+                ).pack(anchor="w", padx=12, pady=10)
+                return
             for key in quote_order:
                 definition = QUOTE_DEFS[key]
                 row = tk.Frame(quote_list_box, bg="#ffffff")
@@ -1151,14 +1656,12 @@ class TickerApp:
                 handle = tk.Label(row, text="☰", bg="#ffffff", fg="#64748b", width=3, cursor="sb_v_double_arrow")
                 handle.pack(side="right", padx=(4, 0))
                 handle.bind("<ButtonPress-1>", lambda _event, quote_key=key: start_quote_drag(quote_key))
-                if key.startswith(STOCK_KEY_PREFIX):
-                    symbol = stock_symbol_from_key(key)
-                    tk.Button(row, text="删除", command=lambda stock_symbol=symbol: remove_a_stock(stock_symbol), width=4).pack(side="right")
+                tk.Button(row, text="删除", command=lambda quote_key=key: remove_quote(quote_key), width=4).pack(side="right")
 
-        quote_list_box = section(quotes_tab, "显示行情", "勾选要显示的品种，按住右侧三横杠拖动排序。")
+        quote_list_box = section(quotes_tab, "显示行情", "勾选要显示的品种，拖动排序；删除预设后可点“恢复默认”找回。")
         render_quote_settings()
-        stock_box = section(quotes_tab, "自选A股", "输入代码后点添加；已添加的股票会保存在上方列表，可直接删除。")
-        add_wide_entry(stock_box, "股票代码", "a_stock_codes")
+        stock_box = section(quotes_tab, "自选新浪行情", "可输入 App 里看到的代码或名称，例如 NKY、HSKTECH、纳斯达克、纽约黄金；程序会自动查找真实行情代码。")
+        add_wide_entry(stock_box, "代码或名称", "sina_codes")
 
         opacity_box = section(display_tab, "透明度", "0 表示完全透明，100 表示完全显示。")
         add_scale(opacity_box, "背景透明度", "background_opacity", "%")
@@ -1210,22 +1713,24 @@ class TickerApp:
 
     def refresh(self) -> None:
         if self.refreshing:
+            self.refresh_pending = True
             return
         if self.refresh_job is not None:
             self.root.after_cancel(self.refresh_job)
             self.refresh_job = None
         self.refreshing = True
+        self.refresh_pending = False
         self.status_label.config(text="刷新")
         threading.Thread(target=self.fetch_in_background, daemon=True).start()
 
     def fetch_in_background(self) -> None:
         start = time.perf_counter()
         visible_keys = set(self.ordered_visible_quote_keys())
-        trend_keys = [
-            key
-            for key in visible_keys
-            if key in GLOBAL_TREND_SYMBOLS or key in {"sh", "star"} or key.startswith(STOCK_KEY_PREFIX)
-        ]
+        if not visible_keys:
+            elapsed = int((time.perf_counter() - start) * 1000)
+            self.root.after(0, lambda: self.apply_quotes([], elapsed))
+            return
+        trend_keys = list(visible_keys)
         now = time.time()
         stale_keys = [
             key for key in trend_keys if now - self.sina_trend_times.get(key, 0) >= 300
@@ -1235,7 +1740,7 @@ class TickerApp:
             for key in stale_keys:
                 self.sina_trend_times[key] = now
         try:
-            sina_quotes = fetch_sina_quotes(self.settings["a_stock_codes"], self.sina_trends)
+            sina_quotes = fetch_sina_quotes(self.settings["sina_codes"], self.sina_trends)
         except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
             sina_quotes = {
                 key: Quote(definition["name"], definition["symbol"], error=str(exc))
@@ -1249,10 +1754,10 @@ class TickerApp:
         quotes = [
             *[
                 (
-                    stock_quote_key(symbol),
-                    sina_quotes.get(stock_quote_key(symbol)) or Quote("自选A股", symbol, error="未设置股票代码"),
+                    custom_quote_key(symbol),
+                    sina_quotes.get(custom_quote_key(symbol)) or Quote("自选行情", symbol, error="未设置新浪代码"),
                 )
-                for symbol in self.settings["a_stock_codes"]
+                for symbol in self.settings["sina_codes"]
             ],
             ("xau", sina_quotes["xau"]),
             ("cn", sina_quotes["cn"]),
@@ -1270,11 +1775,13 @@ class TickerApp:
         today = datetime.now().date()
         if today != self.local_trend_day:
             self.local_trends.clear()
+            self.local_trend_starts.clear()
             self.local_trend_day = today
         for key, quote in quotes:
             if quote.price is None:
                 continue
             local_values = self.local_trends.setdefault(key, [])
+            local_start = self.local_trend_starts.setdefault(key, datetime.now())
             local_values.append(quote.price)
             if len(local_values) > 2000:
                 del local_values[:-2000]
@@ -1283,7 +1790,8 @@ class TickerApp:
                     quote.trend = [*quote.trend, quote.price]
             else:
                 quote.trend = list(local_values)
-                quote.trend_progress = min(1.0, max(0.08, len(local_values) / 48))
+                elapsed = max(0.0, (datetime.now() - local_start).total_seconds())
+                quote.trend_progress = min(1.0, max(0.04, elapsed / fallback_trend_span_seconds(quote.symbol)))
         self.latest_quotes = quotes
         ok_count = 0
         visible = set(self.ordered_visible_quote_keys())
@@ -1292,10 +1800,17 @@ class TickerApp:
             self.update_row(key, quote)
             if key in visible and quote.error is None:
                 ok_count += 1
-        self.status_label.config(text="行情" if ok_count == visible_count else f"{ok_count}/{visible_count}")
+        if visible_count == 0:
+            self.status_label.config(text="暂无行情")
+        else:
+            self.status_label.config(text="行情" if ok_count == visible_count else f"{ok_count}/{visible_count}")
         self.updated_label.config(text=datetime.now().strftime("%H:%M:%S"))
         self.latency_label.config(text=f"{elapsed}ms")
         self.refreshing = False
+        if self.refresh_pending:
+            self.refresh_pending = False
+            self.refresh()
+            return
         self.refresh_job = self.root.after(self.settings["refresh_seconds"] * 1000, self.refresh)
 
     def update_row(self, key: str, quote: Quote) -> None:
@@ -1306,7 +1821,7 @@ class TickerApp:
         row["name"].config(text=quote.name)
         row["price"].config(bg=background)
         row["change"].config(bg=background)
-        self.draw_trend(row["trend"], quote.trend, quote.trend_progress)
+        self.draw_trend(row["trend"], quote.trend, quote.trend_progress, quote.direction)
         if quote.error:
             row["price"].config(text="--", fg=self.text_color("muted"))
             row["change"].config(text="失败", fg=self.text_color("muted"))
@@ -1327,7 +1842,13 @@ class TickerApp:
             parts.append(f"{quote.change:+,.2f}")
         row["change"].config(text=" / ".join(parts) if parts else "--", fg=color)
 
-    def draw_trend(self, canvas: tk.Canvas, values: list[float], progress: float = 1.0) -> None:
+    def draw_trend(
+        self,
+        canvas: tk.Canvas,
+        values: list[float],
+        progress: float = 1.0,
+        direction: str | None = None,
+    ) -> None:
         canvas.delete("all")
         values = [value for value in values if math.isfinite(value)]
         if not values:
@@ -1340,11 +1861,12 @@ class TickerApp:
                 values[round(index * (len(values) - 1) / (draw_width - 1))]
                 for index in range(draw_width)
             ]
-        color_key = "flat"
-        if values[-1] > values[0]:
-            color_key = "up"
-        elif values[-1] < values[0]:
-            color_key = "down"
+        color_key = direction if direction in {"up", "down", "flat"} else "flat"
+        if direction not in {"up", "down", "flat"}:
+            if values[-1] > values[0]:
+                color_key = "up"
+            elif values[-1] < values[0]:
+                color_key = "down"
         color = self.trend_color(color_key)
         if len(values) == 1:
             canvas.create_line(1, height // 2, draw_width, height // 2, fill=color, width=1)
